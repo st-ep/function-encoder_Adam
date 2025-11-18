@@ -1,32 +1,21 @@
-import argparse
-from datetime import datetime
-from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from datasets.van_der_pol import VanDerPolDataset, van_der_pol
 
-from function_encoder.model.mlp import MLP
-from function_encoder.model.neural_ode import NeuralODE, ODEFunc, rk4_step
-from function_encoder.function_encoder import BasisFunctions, FunctionEncoder
+from function_encoder.model.mlp import MLP, MultiHeadedMLP
+from function_encoder.model.neural_ode import NeuralODEFast, ODEFunc, rk4_step, rk4_step_fast
+from function_encoder.function_encoder import BasisFunctions, FunctionEncoder, FunctionEncoderFast
 from function_encoder.utils.training import train_step
 
 import tqdm
 
+import matplotlib.pyplot as plt
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train function encoder on Van der Pol.")
-    parser.add_argument(
-        "--coefficients-l1",
-        type=float,
-        default=1e-2,
-        help="L1 regularization strength applied to inferred coefficients.",
-    )
-    return parser.parse_args()
+import argparse
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -35,15 +24,11 @@ elif torch.backends.mps.is_available():
 else:
     device = "cpu"
 
-args = parse_args()
-torch.manual_seed(42)
+parser = argparse.ArgumentParser()
+parser.add_argument("--num_epochs", type=int, default='1000')
+args = parser.parse_args()
 
-LOGS_ROOT = Path("logs")
-RUN_DIR = LOGS_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S")
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_PATH = RUN_DIR / "van_der_pol_model.pth"
-PLOT_PATH = RUN_DIR / "van_der_pol_grid.png"
-ERROR_PLOT_PATH = RUN_DIR / "van_der_pol_error.png"
+torch.manual_seed(3)
 
 # Load dataset
 
@@ -54,18 +39,16 @@ dataloader_iter = iter(dataloader)
 # Create model
 
 
-n_basis = 20
-basis_functions = BasisFunctions(
-    *[
-        NeuralODE(
-            ode_func=ODEFunc(model=MLP(layer_sizes=[3, 64, 64, 2])),
-            integrator=rk4_step,
-        )
-        for _ in range(n_basis)
-    ]
-)
+n_basis = 10
+basis_functions = MultiHeadedMLP(
+    layer_sizes=[3, 64, 64, 2], num_heads=n_basis)
 
-model = FunctionEncoder(basis_functions).to(device)
+model = NeuralODEFast(
+    ode_func = FunctionEncoderFast(
+        basis_functions=ODEFunc(model=basis_functions),
+    ),
+    integrator=rk4_step_fast
+).to(device)
 
 # Train model
 
@@ -80,28 +63,37 @@ def loss_function(model, batch):
     y1_example = y1_example.to(device)
 
     coefficients, _ = model.compute_coefficients((y0_example, dt_example), y1_example)
-    pred = model((y0, dt), coefficients=coefficients)
+    pred = model((y0, dt, coefficients))
 
     pred_loss = torch.nn.functional.mse_loss(pred, y1)
-    if args.coefficients_l1 > 0:
-        reg_loss = coefficients.abs().mean()
-        pred_loss = pred_loss + args.coefficients_l1 * reg_loss
 
     return pred_loss
 
 
-num_epochs = 10000
+num_epochs = args.num_epochs
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_history = []
 with tqdm.trange(num_epochs) as tqdm_bar:
     for epoch in tqdm_bar:
         batch = next(dataloader_iter)
         loss = train_step(model, optimizer, batch, loss_function)
+        loss_history.append(loss)
         tqdm_bar.set_postfix_str(f"loss: {loss:.2e}")
+
+# Plot loss curve
+plt.figure(figsize=(8, 4))
+plt.plot(loss_history)
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.yscale("log")
+plt.title("Training Loss over Time")
+plt.grid(True)
+plt.savefig(f"speedup_loss_{num_epochs}.png")
+plt.close()
+# plt.show()
 
 
 # Plot a grid of evaluations
-
-import matplotlib.pyplot as plt
 
 
 model.eval()
@@ -124,8 +116,6 @@ with torch.no_grad():
     coefficients, G = model.compute_coefficients((y0_example, dt_example), y1_example)
 
     fig, ax = plt.subplots(3, 3, figsize=(10, 10))
-    error_traces = []
-    time_points = None
 
     for i in range(3):
         for j in range(3):
@@ -137,6 +127,7 @@ with torch.no_grad():
             )
             # We use the coefficients that we computed before
             _c = coefficients[i * 3 + j].unsqueeze(0)
+            # _c = torch.randn((1, n_basis)).to(device)
             s = 0.1  # Time step for simulation
             n = int(10 / s)
             _dt = torch.tensor([s], device=device)
@@ -156,15 +147,11 @@ with torch.no_grad():
             _dt = _dt.unsqueeze(0)
             pred = [x]
             for k in range(n):
-                x = model((x, _dt), coefficients=_c) + x
+                x = model((x, _dt, _c)) + x
+                # x = model((x, _dt)) + x
                 pred.append(x)
             pred = torch.cat(pred, dim=1)
             pred = pred.detach().cpu().numpy()
-
-            trajectory_error = np.mean((pred[0] - y) ** 2, axis=1)
-            if time_points is None:
-                time_points = np.linspace(0, n * s, trajectory_error.shape[0])
-            error_traces.append(trajectory_error)
 
             ax[i, j].set_xlim(-5, 5)
             ax[i, j].set_ylim(-5, 5)
@@ -179,27 +166,9 @@ with torch.no_grad():
         frameon=False,
     )
 
-    fig.savefig(PLOT_PATH, bbox_inches="tight")
-
-    error_traces = np.stack(error_traces, axis=0)
-    fig_error, ax_error = plt.subplots(figsize=(8, 4))
-    for idx, trace in enumerate(error_traces):
-        label = "Individual trajectories" if idx == 0 else None
-        ax_error.plot(
-            time_points, trace, color="C0", alpha=0.2, linewidth=1, label=label
-        )
-    mean_error = error_traces.mean(axis=0)
-    ax_error.plot(time_points, mean_error, color="C1", linewidth=2, label="Mean error")
-    ax_error.set_xlabel("Time")
-    ax_error.set_ylabel("State error (MSE)")
-    ax_error.set_xscale("log")
-    ax_error.set_yscale("log")
-    ax_error.set_title("Prediction error growth")
-    ax_error.legend()
-    fig_error.savefig(ERROR_PLOT_PATH, bbox_inches="tight")
-
-    plt.show()
+    # plt.show()
+    plt.savefig(f"speedup_test_num_epochs={num_epochs}")
 
     # save the model
 
-torch.save(model.state_dict(), MODEL_PATH)
+torch.save(model.state_dict(), f"van_der_pol_speedup_model_n_basis={n_basis}_epochs={num_epochs}.pth")
